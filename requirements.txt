@@ -1,0 +1,27 @@
+# --- Web / UI ---
+streamlit>=1.39.0
+fastapi>=0.110.0
+uvicorn>=0.29.0
+python-multipart>=0.0.9
+
+# --- LLM + RAG (free mode: Groq/Gemini/Ollama chat + local embeddings) ---
+openai>=1.40.0          # used as a generic OpenAI-compatible client (works with Groq, Gemini, Ollama...)
+fastembed>=0.3.0        # free local embeddings, no API key
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-chroma>=0.1.4
+langchain-text-splitters>=0.3.0
+chromadb>=0.5.5
+# langchain-openai>=0.2.0   # only if you set EMBEDDING_PROVIDER=openai (paid)
+
+# --- Parsing / data ---
+pypdf>=4.2.0
+reportlab>=4.0.0
+pandas>=2.0.0
+PyYAML>=6.0
+
+# --- Scheduling / config ---
+APScheduler>=3.10.4,<4.0
+pydantic>=2.6.0
+pydantic-settings>=2.2.0
+python-dotenv>=1.0.0

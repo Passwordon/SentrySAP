@@ -1,0 +1,46 @@
+# SentrySAP rule catalogue (MODULE 3).  Edited rules are picked up on the next watch cycle.
+#
+# scope:  material_po -> evaluated for every (material, OPEN/DELAYED purchase order) pair
+#         material    -> evaluated for every material (po is None)
+#         supplier    -> evaluated for every supplier (adds dup_count / is_newest_duplicate)
+# when:   boolean expression. Operators: AND OR NOT < <= > >= == !=  + - * /
+#         Names: material, po, supplier.   Functions: has_open_po(material), abs(x), len(x)
+#         Fields: material.stock/.reorder_point/.name   po.delay_days/.qty/.supplier/.status
+#                 supplier.reliability_score/.status/.dup_count/.is_newest_duplicate
+# action: generate_alert  (the only action type; execution always needs human approval)
+# executor: what runs on "Approve & Execute" (implemented in FakeSAP.execute)
+# playbook_query: what we ask the knowledge base to find the company's own procedure
+
+rules:
+  - id: low_stock_delayed_supplier
+    description: Low stock while the open PO from the supplier is running late
+    enabled: true
+    scope: material_po
+    when: "material.stock < material.reorder_point AND has_open_po(material) AND po.delay_days > 3"
+    action: generate_alert
+    severity_hint: high
+    executor: escalate_po
+    draft_label: Draft escalation email to supplier
+    playbook_query: "supplier delay escalation SOP"
+
+  - id: low_stock_no_open_po
+    description: Stock below reorder point and no open purchase order exists
+    enabled: true
+    scope: material
+    when: "material.stock < material.reorder_point AND NOT has_open_po(material)"
+    action: generate_alert
+    severity_hint: medium
+    executor: create_replenishment_po
+    draft_label: Draft purchase order
+    playbook_query: "low stock replenishment procedure create purchase order"
+
+  - id: duplicate_supplier_master
+    description: A duplicate supplier master record was created
+    enabled: true
+    scope: supplier
+    when: "supplier.status == 'ACTIVE' AND supplier.dup_count > 1 AND supplier.is_newest_duplicate"
+    action: generate_alert
+    severity_hint: medium
+    executor: block_duplicate_supplier
+    draft_label: Draft note to master-data team
+    playbook_query: "duplicate vendor supplier master data handling procedure"

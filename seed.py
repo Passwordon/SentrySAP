@@ -1,0 +1,143 @@
+"""Seed script:  python seed.py [--no-docs] [--reset-kb] [--no-watch]
+
+1. Rebuilds the FakeSAP SQLite database (30 materials, 8 suppliers, 20 POs) with a few deliberate "situations".
+2. Generates the sample company documents (SOP PDFs, wiki, ABAP) into data/sample_docs/.
+3. Ingests them into ChromaDB (local embeddings by default - free, no key needed).
+4. Runs one watch cycle so alerts - with the company playbook attached - are ready in the Action Queue.
+"""
+from __future__ import annotations
+
+import argparse
+import random
+from datetime import date, timedelta
+
+from sentrysap.config import get_settings
+from sentrysap.db import connect, reset_database, utcnow
+from sentrysap.fake_sap import FakeSAP
+from sentrysap.llm import LLMError
+from sentrysap.sample_docs import write_sample_docs
+
+SUPPLIERS = [  # (id, name, reliability_score)
+    (1, "Bharat Steel Industries Pvt Ltd", 92.0), (2, "Kalyani Alloys Ltd", 85.0),
+    (3, "Apex Fasteners Pvt Ltd", 88.0), (4, "Sundaram Polymers Pvt Ltd", 79.0),
+    (5, "Orient Electricals Ltd", 90.0), (6, "Vijay Lubricants Pvt Ltd", 72.0),
+    (7, "Godavari Packaging Pvt Ltd", 81.0),
+    (8, "APEX FASTENERS PVT LTD", 64.0),  # <- deliberate duplicate of supplier 3 (triggers rule 3)
+]
+
+# (name, reorder_point)
+MATERIALS = [
+    ("Steel Rod 10mm", 100), ("Copper Wire 2.5mm", 80), ("Aluminium Sheet 2mm", 60), ("Hex Bolt M8", 500),
+    ("Hex Nut M8", 500), ("Washer 8mm", 800), ("Ball Bearing 6204", 120), ("Hydraulic Oil 46 (20L)", 40),
+    ("Gear Oil 90 (20L)", 30), ("PVC Pipe 50mm", 150), ("PVC Elbow 50mm", 200), ("Cable Tie 200mm", 1000),
+    ("Welding Electrode E6013", 300), ("Cutting Disc 4in", 400), ("Safety Gloves", 250), ("Safety Helmet", 100),
+    ("Stainless Sheet 304 1.5mm", 50), ("Brass Fitting 1/2in", 220), ("Rubber Gasket 100mm", 180),
+    ("V-Belt B52", 90), ("Contactor 25A", 45), ("MCB 16A", 150), ("LED Panel 40W", 70), ("Carton Box 5-ply", 600),
+    ("Stretch Film 500mm", 200), ("Paint Primer 20L", 35), ("Epoxy Resin 5kg", 60), ("Grinding Wheel 6in", 130),
+    ("Drill Bit HSS 10mm", 160), ("Spring Washer M10", 700),
+]
+
+
+def seed_sap(sap: FakeSAP, rng: random.Random) -> None:
+    """Populate suppliers, materials, purchase orders and a few initial events."""
+    today = date.today()
+    d = lambda n: (today + timedelta(days=n)).isoformat()  # noqa: E731
+    with connect(sap.db_path) as conn:
+        for sid, name, score in SUPPLIERS:
+            conn.execute("INSERT INTO suppliers VALUES (?,?,?,?,?)", (sid, name, score, "ACTIVE", utcnow()))
+
+        low = {"Steel Rod 10mm": 40, "Copper Wire 2.5mm": 25, "Aluminium Sheet 2mm": 30}  # below reorder point
+        mat_ids: dict[str, int] = {}
+        for i, (name, rp) in enumerate(MATERIALS):
+            stock = low.get(name, int(rp * rng.uniform(1.3, 4.0)))
+            mat_ids[name] = 10001 + i
+            conn.execute("INSERT INTO materials VALUES (?,?,?,?)", (mat_ids[name], name, stock, rp))
+
+        po_id = 4500001
+        suppliers = [s[1] for s in SUPPLIERS[:7]]
+
+        def add_po(material: str, supplier: str, qty: int, original: int, slip: int, status: str) -> int:
+            nonlocal po_id
+            conn.execute("INSERT INTO purchase_orders VALUES (?,?,?,?,?,?,?)",
+                         (po_id, supplier, mat_ids[material], qty, d(original + slip), d(original), status))
+            po_id += 1
+            return po_id - 1
+
+        # Scenario A: low stock + PO 6 days late -> rule 1 (supplier delay escalation SOP)
+        a_po = add_po("Steel Rod 10mm", "Bharat Steel Industries Pvt Ltd", 500, 3, 6, "DELAYED")
+        # Decoy: low stock but PO only 1 day late -> must NOT alert
+        add_po("Aluminium Sheet 2mm", "Kalyani Alloys Ltd", 200, 4, 1, "DELAYED")
+        # Scenario B: "Copper Wire 2.5mm" is low with NO open PO -> rule 2 (replenishment SOP)
+
+        healthy = [n for n, _ in MATERIALS if n not in low]
+        rng.shuffle(healthy)
+        for k, name in enumerate(healthy[:18]):
+            supplier = rng.choice(suppliers)
+            qty = rng.randint(100, 800)
+            if k < 3:
+                add_po(name, supplier, qty, -10, 0, "DELIVERED")
+            elif k < 6:  # late POs on healthy-stock materials: decoys that must NOT alert
+                add_po(name, supplier, qty, rng.randint(2, 8), rng.randint(4, 6), "DELAYED")
+            else:
+                add_po(name, supplier, qty, rng.randint(3, 14), rng.randint(0, 2), "OPEN")
+
+        # Initial event log entries so the Action Queue has history from the start
+        sap._log_event(conn, "stock_drop", "material", mat_ids["Steel Rod 10mm"],
+                       {"material": "Steel Rod 10mm", "old_stock": 180, "new_stock": 40, "reorder_point": 100})
+        sap._log_event(conn, "po_delay", "purchase_order", a_po,
+                       {"po": a_po, "supplier": "Bharat Steel Industries Pvt Ltd", "slipped_days": 6})
+        sap._log_event(conn, "stock_drop", "material", mat_ids["Copper Wire 2.5mm"],
+                       {"material": "Copper Wire 2.5mm", "old_stock": 110, "new_stock": 25, "reorder_point": 80})
+        sap._log_event(conn, "duplicate_supplier", "supplier", 8,
+                       {"new_supplier": "APEX FASTENERS PVT LTD", "duplicates": "Apex Fasteners Pvt Ltd"})
+
+
+def main() -> None:
+    """Entry point."""
+    ap = argparse.ArgumentParser(description="Seed SentrySAP demo data")
+    ap.add_argument("--no-docs", action="store_true", help="skip ingesting sample docs into ChromaDB")
+    ap.add_argument("--reset-kb", action="store_true", help="clear the vector store before ingesting")
+    ap.add_argument("--no-watch", action="store_true", help="don't run a watch cycle at the end")
+    args = ap.parse_args()
+
+    settings = get_settings()
+    reset_database(settings.db_path)
+    sap = FakeSAP(settings.db_path)
+    seed_sap(sap, random.Random(42))
+    print(f"[1/4] FakeSAP seeded: {len(sap.materials())} materials, {len(sap.suppliers())} suppliers, "
+          f"{len(sap.purchase_orders())} purchase orders -> {settings.db_path}")
+
+    files = write_sample_docs(settings.sample_docs_dir)
+    print(f"[2/4] Sample documents written to {settings.sample_docs_dir}: {', '.join(f.name for f in files)}")
+
+    if args.no_docs:
+        print("[3/4] Skipped document ingestion (--no-docs).")
+        return
+    # Import here so `--no-docs` works even before the vector stack is configured.
+    from sentrysap.services import build_services
+    services = build_services(start_scheduler=False)
+    try:
+        if args.reset_kb:
+            services.kb.clear()
+        for path in files:
+            res = services.kb.ingest(path.name, path.read_bytes())
+            print(f"      ingested {res.source:<38} type={res.doc_type:<5} chunks={res.chunks}")
+        print("[3/4] Knowledge base ready.")
+    except LLMError as exc:
+        print(f"[3/4] Ingestion failed: {exc}\n      Fix the problem and re-run `python seed.py`, or upload "
+              f"the files from {settings.sample_docs_dir} in the UI.")
+        return
+
+    if args.no_watch:
+        return
+    result = services.watcher.run_cycle()
+    print(f"[4/4] Watch cycle: {result.findings} rule matches, {len(result.new_alerts)} new alerts"
+          + (f" (note: {result.error})" if result.error else ""))
+    for alert in services.alerts.list_alerts("pending"):
+        pb = f"{alert['playbook_source']} ({alert['playbook_score']:.0%})" if alert["playbook_source"] else "NONE"
+        print(f"      #{alert['id']} [{alert['severity']}] {alert['title']}  | playbook: {pb}")
+    print("\nDone. Start the app with:  streamlit run app.py")
+
+
+if __name__ == "__main__":
+    main()
